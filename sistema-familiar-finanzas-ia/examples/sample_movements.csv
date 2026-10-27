@@ -1,5 +1,0 @@
-Fecha,Tipo,Categoria,Cuenta,Moneda,Monto original,Cotizacion,Monto ARS,Descripcion
-2026-08-05,Egreso,Comida,Efectivo,ARS,12500,,12500,Compra supermercado
-2026-08-08,Ingreso,Sueldo,Banco A,ARS,1500000,,1500000,Ingreso mensual
-2026-08-18,Egreso,Salud,Banco A,USD,200,1510,302000,Ejemplo sintético USD
-2026-08-22,Transferencia,Transferencia propia,Banco A → B,ARS,100000,,100000,No computa como gasto

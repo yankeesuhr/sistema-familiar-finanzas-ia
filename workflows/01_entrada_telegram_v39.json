@@ -1,0 +1,2333 @@
+{
+  "name": "01 - Finanzas - Entrada Telegram v39 - sin vencimientos",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "id": "f307cfd8-610a-4bb8-8f7d-ccb504924f71",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        48,
+        768
+      ],
+      "webhookId": "REGENERATE_ON_IMPORT"
+    },
+    {
+      "parameters": {
+        "jsCode": "const trig = $('Telegram Trigger').first().json;\nconst msg = trig.message ?? {};\nconst chatId = String(msg.chat?.id ?? '');\nconst userId = msg.from?.id ?? null;\nconst raw = String(msg.text ?? msg.caption ?? '').trim();\n\nconst norm = s => String(s ?? '')\n  .normalize('NFD').replace(/[\\u0300-\\u036f]/g,'')\n  .toLowerCase().replace(/\\s+/g,' ').trim();\nconst t = norm(raw);\n\nfunction ms(v){ const d=new Date(v); return isNaN(d)?0:d.getTime(); }\nfunction persona(){\n  if(Number(userId)===111111111) return 'Titular A';\n  if(Number(userId)===222222222) return 'Titular B';\n  return 'Sin identificar';\n}\nfunction expiry(hours=2){\n  return new Date(Date.now()+hours*60*60*1000).toISOString();\n}\nfunction pendingRow(data, field, question, status='PENDIENTE', intent='UI_MOVIMIENTO'){\n  return {\n    \"ID pendiente\": `UI-MOV-${chatId}`,\n    \"Chat ID\": msg.chat?.id ?? null,\n    \"Telegram User ID\": userId,\n    \"Persona\": persona(),\n    \"Fecha/Hora\": new Date().toISOString(),\n    \"Intención\": intent,\n    \"Mensaje original\": raw,\n    \"Datos parciales JSON\": JSON.stringify(data ?? {}),\n    \"Campo pendiente\": field ?? null,\n    \"Pregunta enviada\": question ?? null,\n    \"Opciones sugeridas\": null,\n    \"Confianza\": 1,\n    \"Estado\": status,\n    \"Expira\": status==='PENDIENTE' ? expiry(2) : new Date().toISOString(),\n    \"Mensaje Telegram ID\": msg.message_id ?? null\n  };\n}\n\nconst allPending = items.map(i=>i.json);\nconst candidates = allPending.filter(r =>\n  String(r['Chat ID']??'')===chatId &&\n  String(r['Intención']||'').toUpperCase()==='UI_MOVIMIENTO' &&\n  String(r.Estado||'').toUpperCase()==='PENDIENTE' &&\n  (!r.Expira || ms(r.Expira)>Date.now())\n).sort((a,b)=>ms(b['Fecha/Hora'])-ms(a['Fecha/Hora']));\n\nconst activeRow = candidates[0] || null;\nconst activeIntent='UI_MOVIMIENTO';\nlet st = null;\nif(activeRow){\n  try{ st=JSON.parse(activeRow['Datos parciales JSON']||'null'); }catch(e){}\n}\n\nfunction parseMoney(raw) {\n  if (!raw) return null;\n  let s = String(raw).replace(/[^\\d.,-]/g,'').trim();\n  if (!s) return null;\n  const hasComma=s.includes(','), hasDot=s.includes('.');\n  if (hasComma && hasDot) s=s.replace(/\\./g,'').replace(',','.');\n  else if (hasComma) s=s.replace(',','.');\n  else if (hasDot && /^\\d{1,3}(\\.\\d{3})+$/.test(s)) s=s.replace(/\\./g,'');\n  const n=Number(s);\n  return Number.isFinite(n)?n:null;\n}\nfunction parseAmountDetail(input){\n  const s=String(input||'').trim();\n  const m=s.match(/^\\s*\\$?\\s*(-?\\d[\\d.]*(?:,\\d{1,2})?)\\s*(.*)$/);\n  if(!m) return null;\n  const amount=parseMoney(m[1]);\n  if(amount===null) return null;\n  let rest=String(m[2]||'').trim();\n  const usdRx=/(?:\\bUSD\\b|U\\$S|US\\$|\\bDLS\\b|\\bD[ÓO]LARES?\\b)/i;\n  const currency=usdRx.test(rest)?'USD':'ARS';\n  let cot=null;\n  if(currency==='USD'){\n    const cm=rest.match(/\\b(?:cot|cotiz(?:acion|ación)?)\\.?\\s*[:=]?\\s*\\$?\\s*(\\d{1,3}(?:\\.\\d{3})+(?:,\\d{1,2})?|\\d+(?:[.,]\\d{1,2})?)/i);\n    if(cm){ cot=parseMoney(cm[1]); rest=rest.replace(cm[0],' ').trim(); }\n    rest=rest.replace(usdRx,' ').replace(/\\s+/g,' ').trim();\n  }\n  return {amount,detail:rest||null,currency,cot:(cot&&cot>0)?cot:null};\n}\nfunction todayIso(){\n  const parts=new Intl.DateTimeFormat('en-CA',{timeZone:'America/Argentina/Buenos_Aires',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());\n  const g=x=>parts.find(p=>p.type===x)?.value;\n  return `${g('year')}-${g('month')}-${g('day')}`;\n}\n\nconst CANCEL = ['cancelar','❌ cancelar','↩️ menu principal','↩️ menú principal','🏠 menu principal','🏠 menú principal'];\nif(st && CANCEL.includes(t)){\n  return [{json:{\n    ...trig,\n    ui_mode:'main',ui_only:true,chat_id:msg.chat?.id,\n    ui_pending_write:true,\n    ui_pending_row:pendingRow(st,'cancelado','Flujo cancelado','CANCELADO',activeIntent)\n  }}];\n}\n// --------------------------------------------------------------\n// Carga guiada de gastos / ingresos.\n// --------------------------------------------------------------\nconst expenseCategories={\n  'comida':'Comida','casa':'Casa','salud':'Salud','educacion':'Educación','ocio':'Ocio',\n  'impuestos':'Impuestos','gastos financieros':'Gastos financieros','gastos varios':'Gastos varios',\n  'cositas de casa':'Cositas de Casa','vehiculos':'Vehículos'\n};\nconst incomeTypes={\n  '💼 sueldo':{label:'Sueldo',router:'sueldo'},'sueldo':{label:'Sueldo',router:'sueldo'},\n  '🏪 cositas de casa':{label:'Cositas de Casa',router:'Cositas de Casa'},'cositas de casa':{label:'Cositas de Casa',router:'Cositas de Casa'},\n  '🏛️ subsidios':{label:'Subsidios',router:'Subsidios'},'subsidios':{label:'Subsidios',router:'Subsidios'},\n  '➕ otros ingresos':{label:'Otros ingresos',router:'Otros ingresos'},'otros ingresos':{label:'Otros ingresos',router:'Otros ingresos'}\n};\n\nif(st?.flow==='expense'){\n  if(st.step==='category'){\n    const category=expenseCategories[t]||null;\n    if(!category) return [{json:{...trig,ui_mode:'expense_category',ui_only:true,ui_error:'Elegí una categoría.',chat_id:msg.chat?.id,ui_pending_write:false}}];\n    const next={...st,category,step:'amount'};\n    return [{json:{...trig,ui_mode:'expense_amount',ui_only:true,chat_id:msg.chat?.id,ui_pending_write:true,ui_pending_row:pendingRow(next,'importe','¿Cuánto gastaste?','PENDIENTE','UI_MOVIMIENTO')}}];\n  }\n  if(st.step==='amount'){\n    const parsed=parseAmountDetail(raw);\n    if(!parsed || parsed.amount<=0) return [{json:{...trig,ui_mode:'expense_amount',ui_only:true,ui_error:'Importe inválido. Ej.: 12500, 12500 supermercado, 2000 USD o 2000 USD cot 1510.',chat_id:msg.chat?.id,ui_pending_write:false}}];\n    const next={...st,amount:parsed.amount,detail:parsed.detail,currency:parsed.currency||'ARS',cot:parsed.cot||null,date:todayIso(),step:'confirm'};\n    return [{json:{...trig,ui_mode:'expense_confirm',ui_only:true,chat_id:msg.chat?.id,move_data:next,ui_pending_write:true,ui_pending_row:pendingRow(next,'confirmacion','¿Confirmar gasto?','PENDIENTE','UI_MOVIMIENTO')}}];\n  }\n  if(st.step==='confirm'){\n    if(!['confirmar','✅ confirmar'].includes(t)) return [{json:{...trig,ui_mode:'expense_confirm',ui_only:true,ui_error:'Tocá Confirmar o Cancelar.',chat_id:msg.chat?.id,move_data:st,ui_pending_write:false}}];\n    const payload=JSON.parse(JSON.stringify(trig));\n    payload.message=payload.message||{};\n    payload.message.text=String(st.currency||'ARS').toUpperCase()==='USD' ? `${st.category} ${st.amount} USD${st.cot?` cot ${st.cot}`:''}${st.detail?' '+st.detail:''}` : `${st.category} ${st.amount}${st.detail?' '+st.detail:''}`;\n    return [{json:{\n      ...trig,ui_mode:'forward_router',ui_only:true,chat_id:msg.chat?.id,\n      router_payload:payload,forward_after_persist:true,ui_restore_main:true,\n      ui_pending_write:true,ui_pending_row:pendingRow(st,'completo','Gasto confirmado','CONFIRMADO','UI_MOVIMIENTO')\n    }}];\n  }\n}\n\nif(st?.flow==='income'){\n  if(st.step==='category'){\n    const sel=incomeTypes[t]||null;\n    if(!sel) return [{json:{...trig,ui_mode:'income_category',ui_only:true,ui_error:'Elegí el tipo de ingreso.',chat_id:msg.chat?.id,ui_pending_write:false}}];\n    const next={...st,income_label:sel.label,income_router:sel.router,step:'amount'};\n    return [{json:{...trig,ui_mode:'income_amount',ui_only:true,chat_id:msg.chat?.id,ui_pending_write:true,ui_pending_row:pendingRow(next,'importe','¿Cuánto ingresó?','PENDIENTE','UI_MOVIMIENTO')}}];\n  }\n  if(st.step==='amount'){\n    const parsed=parseAmountDetail(raw);\n    if(!parsed || parsed.amount<=0) return [{json:{...trig,ui_mode:'income_amount',ui_only:true,ui_error:'Importe inválido. Ej.: 500000 o 500000 sueldo octubre.',chat_id:msg.chat?.id,ui_pending_write:false}}];\n    const next={...st,amount:parsed.amount,detail:parsed.detail,date:todayIso(),step:'confirm'};\n    return [{json:{...trig,ui_mode:'income_confirm',ui_only:true,chat_id:msg.chat?.id,move_data:next,ui_pending_write:true,ui_pending_row:pendingRow(next,'confirmacion','¿Confirmar ingreso?','PENDIENTE','UI_MOVIMIENTO')}}];\n  }\n  if(st.step==='confirm'){\n    if(!['confirmar','✅ confirmar'].includes(t)) return [{json:{...trig,ui_mode:'income_confirm',ui_only:true,ui_error:'Tocá Confirmar o Cancelar.',chat_id:msg.chat?.id,move_data:st,ui_pending_write:false}}];\n    const payload=JSON.parse(JSON.stringify(trig));\n    payload.message=payload.message||{};\n    payload.message.text=`ingreso ${st.income_router} ${st.amount}${st.detail?' '+st.detail:''}`;\n    return [{json:{\n      ...trig,ui_mode:'forward_router',ui_only:true,chat_id:msg.chat?.id,\n      router_payload:payload,forward_after_persist:true,ui_restore_main:true,\n      ui_pending_write:true,ui_pending_row:pendingRow(st,'completo','Ingreso confirmado','CONFIRMADO','UI_MOVIMIENTO')\n    }}];\n  }\n}\n\n// Menú principal y acciones.\nconst exact={\n  '/start':'main','/menu':'main','menu':'main','🏠 menu principal':'main','🏠 menú principal':'main',\n  '💸 registrar gasto':'start_expense',\n  '💰 registrar ingreso':'start_income',\n  '📊 consultas':'menu_moves','🔎 movimientos':'menu_moves',\n  '✏️ corregir movimiento':'correction_help',\n  '📅 cierre mensual':'menu_close',\n  '🛠️ corregir / pendientes':'menu_fix',\n  '⚙️ mas':'menu_more','⚙️ más':'menu_more',\n  '⚠️ ver pendientes':'show_pending',\n  '🔧 diagnosticar problema':'diagnose',\n  '📄 que documento falta':'missing_doc','📄 qué documento falta':'missing_doc',\n  '🩺 estado del sistema':'system_status',\n  'ℹ️ ayuda':'help'\n};\nlet mode=exact[t]||null;\n\n// Protección transitoria: si quedó visible un botón viejo del teclado anterior,\n// vuelve al menú sin derivarlo al Router.\nconst retiredLegacyButtons=[\n  '⏰ vencimientos','➕ cargar vencimiento','➕ cargar vencimientos',\n  '➕ cargar faltante','⚠️ vencidos','⚠️ ver vencidos',\n  '📆 proximos vencimientos','📆 próximos vencimientos'\n];\nif(retiredLegacyButtons.includes(t)) mode='main';\n\nif(mode==='start_expense'){\n  const start={flow:'expense',step:'category',started_at:new Date().toISOString()};\n  return [{json:{...trig,ui_mode:'expense_category',ui_only:true,chat_id:msg.chat?.id,ui_pending_write:true,ui_pending_row:pendingRow(start,'categoria','Elegí la categoría del gasto.','PENDIENTE','UI_MOVIMIENTO')}}];\n}\nif(mode==='start_income'){\n  const start={flow:'income',step:'category',started_at:new Date().toISOString()};\n  return [{json:{...trig,ui_mode:'income_category',ui_only:true,chat_id:msg.chat?.id,ui_pending_write:true,ui_pending_row:pendingRow(start,'tipo_ingreso','Elegí el tipo de ingreso.','PENDIENTE','UI_MOVIMIENTO')}}];\n}\n\nconst forwardMap={\n  '📅 iniciar cierre mensual':'iniciar cierre mensual',\n  '▶️ continuar cierre':'continuar cierre',\n  '📋 ver progreso':'estado cierre',\n  '❌ cancelar cierre':'cancelar cierre',\n  '📋 gastos de este mes':'mostrame los gastos de este mes',\n  '💵 ingresos de este mes':'mostrame los ingresos de este mes',\n  '🏷️ gastos por categoria':'gastos por categoria este mes','🏷️ gastos por categoría':'gastos por categoria este mes',\n  '💵 disponible':'cuanto disponible tenemos',\n  '💳 deuda tarjetas':'cuanto debemos de tarjetas',\n  '📈 inversiones':'inversiones',\n  '🧾 patrimonio':'patrimonio'\n};\n\nif(!mode && forwardMap[t]){\n  const out=JSON.parse(JSON.stringify(trig));\n  out.message=out.message||{};\n  out.message.text=forwardMap[t];\n  return [{json:{...out,ui_only:false,ui_mode:'pass',ui_pending_write:false,ui_restore_main:false}}];\n}\n\nif(mode){\n  return [{json:{...trig,ui_mode:mode,ui_only:true,chat_id:msg.chat?.id,ui_pending_write:false}}];\n}\n\nreturn [{json:{...trig,ui_only:false,ui_mode:'pass',ui_pending_write:false,ui_restore_main:false}}];\n"
+      },
+      "id": "c51d9ebf-fc20-4908-bcf2-fb03a6c8cd24",
+      "name": "UI - Detectar menú / flujo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        496,
+        768
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "6b40e1d6-c567-408a-9fbc-7b1751ad8243",
+              "leftValue": "={{ $json.ui_only }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4791872e-bea6-433d-947a-16a2422517f3",
+      "name": "¿Pasa al Router 02?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        768
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "WORKFLOW_ID_RELINK_REQUIRED",
+          "mode": "list",
+          "cachedResultUrl": "",
+          "cachedResultName": "02 - Finanzas - Router determinístico SIN IA v41 - PDF v95"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "95bb7469-853d-4108-b4b8-c4d21d5e75c4",
+      "name": "Llamar 02 - Router",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        3408,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Pendientes",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "c365ba4a-11e3-4f18-b866-72735dde62c4",
+      "name": "UI - Leer Pendientes",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.6,
+      "position": [
+        944,
+        848
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Cierre_Checklist",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "e6f99c7e-f7e6-46f8-a60e-70a8a887a379",
+      "name": "UI - Leer Cierre_Checklist",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.6,
+      "position": [
+        1168,
+        848
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst base=$('UI - Detectar menú / flujo').first().json;\nconst mode=base.ui_mode;\nconst chatId=String(base.chat_id ?? base.message?.chat?.id ?? '');\n\nconst pend=$('UI - Leer Pendientes').all().map(i=>i.json).filter(r=>{\n  const intent=String(r['Intención']||'').toUpperCase();\n  return String(r['Chat ID']??'')===chatId &&\n    String(r.Estado||'').toUpperCase()==='PENDIENTE' &&\n    (intent==='UI_MOVIMIENTO' || !intent.startsWith('UI_'));\n});\nconst checks=$('UI - Leer Cierre_Checklist').all().map(i=>i.json);\n\nconst activeClose=pend.find(r=>String(r['Intención']||'').toUpperCase()==='CIERRE_MENSUAL') || null;\n\nfunction periodKey(r){return String(r.Periodo??'');}\nconst periods=[...new Set(checks.map(periodKey).filter(Boolean))].sort();\nconst currentPeriod=periods.length?periods[periods.length-1]:null;\nconst currentChecks=currentPeriod?checks.filter(r=>periodKey(r)===currentPeriod):[];\n\nfunction num(v){\n  if(v===null||v===undefined||v==='') return null;\n  if(typeof v==='number') return v;\n  let s=String(v).replace(/[^\\d,.-]/g,'');\n  if(s.includes(',')&&s.includes('.')) s=s.replace(/\\./g,'').replace(',','.');\n  else if(s.includes(',')) s=s.replace(',','.');\n  const n=Number(s); return Number.isFinite(n)?n:null;\n}\nconst missingDocs=currentChecks.filter(r=>{\n  const st=String(r['Estado']??r['Estado conciliación']??'').toUpperCase();\n  const tipo=String(r['Tipo control']??r.Tipo??'').toUpperCase();\n  return (st===''||st==='PENDIENTE'||st==='FALTA') && /DOCUMENTO|TARJETA/.test(tipo);\n});\nconst diffs=currentChecks.filter(r=>{\n  const d=num(r['Diferencia ARS']??r['Diferencia cierre ARS']??r['Diferencia']??null);\n  return d!==null && Math.abs(d)>0.01;\n});\nlet screen=mode, message='';\nif(base.ui_error) message='⚠️ '+base.ui_error+'\\n\\n';\n\nif(mode==='main'){\n  message+='🏠 Finanzas familiares\\nElegí una opción. También podés escribir directamente como hasta ahora.';\n}\nelse if(mode==='expense_category'){\n  screen='expense_category'; message+='💸 Registrar gasto\\nElegí la categoría:';\n}\nelse if(mode==='expense_amount'){\n  screen='expense_amount'; message+=`💸 ${base.ui_error?'':'Categoría: '+(base.ui_pending_row?JSON.parse(base.ui_pending_row['Datos parciales JSON']||'{}').category||'':'')+'\\n'}Escribí el importe. Ej.: 12500 supermercado. Si es en dólares: 2000 USD o 2000 USD cot 1510.`;\n}\nelse if(mode==='expense_confirm'){\n  screen='expense_confirm';\n  const x=base.move_data||(()=>{try{return JSON.parse(base.ui_pending_row?.['Datos parciales JSON']||'{}')}catch(e){return {}}})();\n  const cur=String(x.currency||'ARS').toUpperCase();\n  if(cur==='USD'){\n    const cot=Number(x.cot||0);\n    const eq=cot>0?Number(x.amount||0)*cot:null;\n    message+=`💸 Confirmar gasto\\n\\n${x.category||'-'} — US$${Number(x.amount||0).toLocaleString('es-AR',{minimumFractionDigits:0,maximumFractionDigits:2})}\\nEfectivo USD — ${x.date||''}${cot>0?`\\nCotización real: $${cot.toLocaleString('es-AR',{maximumFractionDigits:2})}/USD\\nEquivalente: $${eq.toLocaleString('es-AR',{minimumFractionDigits:0,maximumFractionDigits:2})}`:'\\nSin cotización manual: se valuará para informes con la regla multimoneda.'}${x.detail?`\\nDetalle: ${x.detail}`:''}\\n\\n¿Confirmar?`;\n  }else{\n    message+=`💸 Confirmar gasto\\n\\n${x.category||'-'} — $${Number(x.amount||0).toLocaleString('es-AR')}\\nEfectivo — ${x.date||''}${x.detail?`\\nDetalle: ${x.detail}`:''}\\n\\n¿Confirmar?`;\n  }\n}\nelse if(mode==='income_category'){\n  screen='income_category'; message+='💰 Registrar ingreso\\nElegí el tipo:';\n}\nelse if(mode==='income_amount'){\n  screen='income_amount'; message+='💰 Escribí el importe. Podés agregar un detalle opcional.';\n}\nelse if(mode==='income_confirm'){\n  screen='income_confirm';\n  const x=base.move_data||(()=>{try{return JSON.parse(base.ui_pending_row?.['Datos parciales JSON']||'{}')}catch(e){return {}}})();\n  message+=`💰 Confirmar ingreso\\n\\n${x.income_label||'-'} — $${Number(x.amount||0).toLocaleString('es-AR')}\\nEfectivo — ${x.date||''}${x.detail?`\\nDetalle: ${x.detail}`:''}\\n\\n¿Confirmar?`;\n}\nelse if(mode==='correction_help'){\n  screen='plain_main';\n  message+='✏️ Corregir movimiento\\n\\nEscribilo así:\\ncorregir Vehículos 13000 12/10 - monto 15000\\n\\nTambién podés cambiar categoría, fecha o detalle. Ej.:\\ncorregir farmacia 50000 12/10 - categoria Salud\\n\\nTambién acepta la palabra “por” en lugar del guion.';\n}\nelse if(mode==='forward_router'){\n  screen='forward_router'; message='';\n}\nelse if(mode==='menu_close'){\n  screen=activeClose?'close_active':'close_idle';\n  message+=activeClose?'📅 Hay un cierre mensual en curso.':'📅 No hay un cierre mensual pendiente.';\n  if(currentPeriod) message+=`\\nÚltimo período detectado: ${currentPeriod}.`;\n}\nelse if(mode==='menu_moves'){\n  screen='moves_menu';\n  message+='📊 Consultas\\nElegí una opción:';\n}\nelse if(mode==='menu_fix'){\n  const hasUseful=pend.length>0 || diffs.length>0 || missingDocs.length>0 || !!activeClose;\n  screen=hasUseful?'fix_some':'fix_none';\n  message+='🛠️ Corregir / Pendientes';\n  if(pend.length) message+=`\\nPendientes activos: ${pend.length}.`;\n  else message+='\\nNo hay pendientes activos.';\n}\nelse if(mode==='menu_more'){\n  screen='more_menu';\n  message+='⚙️ Más';\n}\nelse if(mode==='show_pending'){\n  screen='plain_main';\n  if(!pend.length) message+='✅ No hay pendientes activos.';\n  else{\n    message+=`⚠️ Pendientes activos: ${pend.length}\\n\\n`;\n    message+=pend.slice(0,10).map((r,i)=>{\n      const intent=String(r['Intención']||'Pendiente').replace(/_/g,' ');\n      const q=String(r['Pregunta enviada']||r['Campo pendiente']||'').trim();\n      return `${i+1}. ${intent}${q?` — ${q}`:''}`;\n    }).join('\\n');\n    if(pend.length>10) message+=`\\n… y ${pend.length-10} más.`;\n  }\n}\nelse if(mode==='missing_doc'){\n  screen='plain_main';\n  if(!currentPeriod) message+='No encuentro un cierre mensual iniciado.';\n  else if(!missingDocs.length) message+=`✅ En ${currentPeriod} no falta ningún documento del checklist.`;\n  else{\n    message+=`📄 Documentos faltantes para ${currentPeriod}:\\n`;\n    message+=missingDocs.map(r=>`• ${r.Cuenta??r['Cuenta / tarjeta']??r['Item']??'Documento'}`).join('\\n');\n  }\n}\nelse if(mode==='diagnose'){\n  screen='plain_main';\n  message+='🔧 Diagnóstico\\n';\n  if(!currentPeriod) message+='No hay checklist de cierre disponible.';\n  else{\n    message+=`Período: ${currentPeriod}\\n`;\n    if(!diffs.length && !missingDocs.length) message+='✅ No detecto diferencias de conciliación ni documentos faltantes.';\n    if(diffs.length){\n      message+=`\\n⚠️ Diferencias:\\n`+diffs.map(r=>{\n        const d=num(r['Diferencia ARS']??r['Diferencia cierre ARS']??r.Diferencia);\n        return `• ${r.Cuenta??r['Cuenta / tarjeta']??'Cuenta'}: $${Math.abs(d).toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2})}`;\n      }).join('\\n');\n    }\n    if(missingDocs.length){\n      message+=`\\n📄 Faltan:\\n`+missingDocs.map(r=>`• ${r.Cuenta??r['Cuenta / tarjeta']??'Documento'}`).join('\\n');\n    }\n  }\n}\nelse if(mode==='system_status'){\n  screen='plain_main';\n  message+=`🩺 Estado del sistema\\n`;\n  message+=`• Cierre activo: ${activeClose?'Sí':'No'}\\n`;\n  message+=`• Pendientes: ${pend.length}\\n`;\n  message+=`• Documentos faltantes: ${missingDocs.length}\\n`;\n  message+=`• Diferencias detectadas: ${diffs.length}`;\n}\nelse if(mode==='help'){\n  screen='plain_main';\n  message+='ℹ️ Usá el menú para cierres, consultas de movimientos y resolución de pendientes. También podés seguir escribiendo mensajes normales como hasta ahora.';\n}\nelse{\n  screen='main'; message+='🏠 Finanzas familiares\\nElegí una opción:';\n}\nreturn [{json:{\n  ...base,\n  screen,\n  message,\n  ui_pending_write:!!base.ui_pending_write,\n  ui_pending_row:base.ui_pending_row||null\n}}];\n"
+      },
+      "id": "ae0eb816-e7b3-477e-942a-0955b7bae9d6",
+      "name": "UI - Construir respuesta contextual",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1840,
+        848
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('UI - Construir respuesta contextual').first().json.chat_id }}",
+        "text": "={{ $('UI - Construir respuesta contextual').first().json.message }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "💸 Registrar gasto",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "💰 Registrar ingreso",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "📊 Consultas",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "✏️ Corregir movimiento",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "📅 Cierre mensual",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "⚙️ Más",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true,
+          "one_time_keyboard": false
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "f4eabf91-5138-46c1-8a49-af6c0fa6e222",
+      "name": "UI - Enviar menú principal",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3856,
+        1040
+      ],
+      "webhookId": "REGENERATE_ON_IMPORT"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('UI - Construir respuesta contextual').first().json.chat_id }}",
+        "text": "={{ $('UI - Construir respuesta contextual').first().json.message }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "📅 Iniciar cierre mensual",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "🏠 Menú principal",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true,
+          "one_time_keyboard": false
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "e977092e-620a-4e58-9bd0-9f07a0efa366",
+      "name": "UI - Menú cierre sin cierre activo",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        4080,
+        1136
+      ],
+      "webhookId": "REGENERATE_ON_IMPORT"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('UI - Construir respuesta contextual').first().json.chat_id }}",
+        "text": "={{ $('UI - Construir respuesta contextual').first().json.message }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "▶️ Continuar cierre",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "📋 Ver progreso",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "📄 Qué documento falta",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "⚠️ Ver pendientes",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "🔧 Diagnosticar problema",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "❌ Cancelar cierre",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "🏠 Menú principal",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true,
+          "one_time_keyboard": false
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "02979bb5-164f-45dd-bf76-71d4c1ab79c2",
+      "name": "UI - Menú cierre activo",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        4304,
+        1232
+      ],
+      "webhookId": "REGENERATE_ON_IMPORT"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('UI - Construir respuesta contextual').first().json.chat_id }}",
+        "text": "={{ $('UI - Construir respuesta contextual').first().json.message }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "📋 Gastos de este mes",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "💵 Ingresos de este mes",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "🏷️ Gastos por categoría",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "💵 Disponible",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "💳 Deuda tarjetas",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "📈 Inversiones",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "🧾 Patrimonio",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "🏠 Menú principal",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true,
+          "one_time_keyboard": false
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "d8dd4215-e19c-46de-99c5-7d7dca33e537",
+      "name": "UI - Menú movimientos",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        5200,
+        1616
+      ],
+      "webhookId": "REGENERATE_ON_IMPORT"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('UI - Construir respuesta contextual').first().json.chat_id }}",
+        "text": "={{ $('UI - Construir respuesta contextual').first().json.message }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "⚠️ Ver pendientes",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "🔧 Diagnosticar problema",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "📄 Qué documento falta",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "✏️ Corregir movimiento",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "🏠 Menú principal",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true,
+          "one_time_keyboard": false
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "225f2c8a-c9ca-49b1-9e3d-980302992d12",
+      "name": "UI - Menú corregir con pendientes",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        5424,
+        1712
+      ],
+      "webhookId": "REGENERATE_ON_IMPORT"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('UI - Construir respuesta contextual').first().json.chat_id }}",
+        "text": "={{ $('UI - Construir respuesta contextual').first().json.message }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "✏️ Corregir movimiento",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "🏠 Menú principal",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true,
+          "one_time_keyboard": false
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "cb3695e4-0768-407f-975d-ab345468f458",
+      "name": "UI - Menú corregir limpio",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        5648,
+        1808
+      ],
+      "webhookId": "REGENERATE_ON_IMPORT"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('UI - Construir respuesta contextual').first().json.chat_id }}",
+        "text": "={{ $('UI - Construir respuesta contextual').first().json.message }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "⚠️ Ver pendientes",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "🔧 Diagnosticar problema",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "🩺 Estado del sistema",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "ℹ️ Ayuda",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "🏠 Menú principal",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true,
+          "one_time_keyboard": false
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "a46c1185-3f2b-4ff5-b652-bc55b0b26857",
+      "name": "UI - Menú más",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        5872,
+        1904
+      ],
+      "webhookId": "REGENERATE_ON_IMPORT"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('UI - Construir respuesta contextual').first().json.chat_id }}",
+        "text": "={{ $('UI - Construir respuesta contextual').first().json.message }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "💸 Registrar gasto",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "💰 Registrar ingreso",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "📊 Consultas",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "✏️ Corregir movimiento",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "📅 Cierre mensual",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "⚙️ Más",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true,
+          "one_time_keyboard": false
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "7d9d8385-4e98-4ef6-946d-53846adccafe",
+      "name": "UI - Respuesta contextual",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        8560,
+        3056
+      ],
+      "webhookId": "REGENERATE_ON_IMPORT"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "acd66efc-81e3-4b20-b4c9-20a7ad9c4685",
+              "leftValue": "={{ $json.screen }}",
+              "rightValue": "main",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f9a12228-9497-4f65-9533-68de34f0e0cd",
+      "name": "¿Pantalla main?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3632,
+        1136
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "9b1c0a19-4f1c-434e-b32b-b6f8c981a281",
+              "leftValue": "={{ $json.screen }}",
+              "rightValue": "close_idle",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e61a41a3-d6f7-4da6-a234-0837ccbbb6ff",
+      "name": "¿Pantalla cierre idle?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3856,
+        1232
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "92ea0329-4b29-45f4-8747-d7e5520a2479",
+              "leftValue": "={{ $json.screen }}",
+              "rightValue": "close_active",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "adee984b-4166-4940-be85-78fbe7a33f38",
+      "name": "¿Pantalla cierre activa?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4080,
+        1328
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0b5fca82-6856-4077-a083-1609785cb768",
+              "leftValue": "={{ $json.screen }}",
+              "rightValue": "moves_menu",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "03af323c-4c32-4e24-b2dc-d0e8be792fe5",
+      "name": "¿Pantalla movimientos?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4976,
+        1712
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "513a319f-1d32-4c64-9f26-794d98735e24",
+              "leftValue": "={{ $json.screen }}",
+              "rightValue": "fix_some",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e97884b1-b237-4454-bf9c-c5f4f05f93a1",
+      "name": "¿Pantalla corregir con pendientes?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5200,
+        1808
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "35e7e204-5b95-4794-9862-0aa394cf4d19",
+              "leftValue": "={{ $json.screen }}",
+              "rightValue": "fix_none",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "57a7ee94-2c1e-4dd2-a2cb-9973720fa26a",
+      "name": "¿Pantalla corregir limpio?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5424,
+        1904
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "41887efe-9e92-4705-8468-0e995c565afd",
+              "leftValue": "={{ $json.screen }}",
+              "rightValue": "more_menu",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "58d63eec-71b1-4863-bba5-9ed975ceacc7",
+      "name": "¿Pantalla más?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5648,
+        2000
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a7680972-e22f-427e-a1a9-4c9bef6b9898",
+              "leftValue": "={{ $json.screen }}",
+              "rightValue": "ask_concept",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "8f2ae48d-9fd7-447f-b89e-5132182cb4ed",
+      "name": "¿Pantalla concepto?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6544,
+        2384
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "20b32035-e416-493d-9a8d-bb4c67fb47eb",
+              "leftValue": "={{ $json.screen }}",
+              "rightValue": "ask_date",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "00d75f97-4173-4095-a36e-328666dd3f15",
+      "name": "¿Pantalla fecha?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6768,
+        2480
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0a9dc20a-99b1-43aa-8bfd-ae32c6a5acb3",
+              "leftValue": "={{ $json.screen }}",
+              "rightValue": "ask_amount",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "fd3fe040-0ae8-496c-9461-7bc8feaa9f04",
+      "name": "¿Pantalla importe?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6992,
+        2576
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Pendientes",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "1fde7105-67c6-4444-85ce-6e02caf9d156",
+      "name": "UI - Leer estado guiado persistente",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.6,
+      "position": [
+        272,
+        768
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "63b7e05b-fe55-4f55-b2f6-73cb46973102",
+              "leftValue": "={{ $json.ui_pending_write }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "df7d9894-5de0-4864-9b06-247734de7eef",
+      "name": "¿Persistir estado guiado?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2064,
+        848
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json:$('UI - Construir respuesta contextual').first().json.ui_pending_row}];"
+      },
+      "id": "9235ca2b-b9cd-46f1-aa41-461c78137266",
+      "name": "UI - Preparar estado guiado",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2288,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Pendientes",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "ID pendiente"
+          ],
+          "schema": [],
+          "attemptToConvertTypes": true,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "d15ecbe6-297b-4f27-8dc4-b3d681bbc1c0",
+      "name": "UI - Guardar estado guiado",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.6,
+      "position": [
+        2512,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json:$('UI - Construir respuesta contextual').first().json}];"
+      },
+      "id": "a4957836-629a-4039-b26b-31ccf54333b8",
+      "name": "UI - Recuperar respuesta después de persistir",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2736,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('UI - Construir respuesta contextual').first().json.chat_id }}",
+        "text": "={{ $('UI - Construir respuesta contextual').first().json.message }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "Comida",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "Casa",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "Salud",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "Educación",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "Ocio",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "Impuestos",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "Gastos financieros",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "Gastos varios",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "Cositas de Casa",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "Vehículos",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "❌ Cancelar",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true,
+          "one_time_keyboard": true
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "2f46fc2c-941a-41a5-9537-38817d1fbfdc",
+      "name": "UI - Menú categorías gasto",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        7440,
+        2576
+      ],
+      "webhookId": "REGENERATE_ON_IMPORT"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('UI - Construir respuesta contextual').first().json.chat_id }}",
+        "text": "={{ $('UI - Construir respuesta contextual').first().json.message }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "❌ Cancelar",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true,
+          "one_time_keyboard": false
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "53f4a9d7-db53-4e0a-b0c8-bec99ae26818",
+      "name": "UI - Pedir importe gasto",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        7664,
+        2672
+      ],
+      "webhookId": "REGENERATE_ON_IMPORT"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('UI - Construir respuesta contextual').first().json.chat_id }}",
+        "text": "={{ $('UI - Construir respuesta contextual').first().json.message }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "✅ Confirmar",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "❌ Cancelar",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true,
+          "one_time_keyboard": true
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "b293f60f-2dd6-4d8b-bed4-12124e6721d1",
+      "name": "UI - Confirmar gasto guiado",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        7888,
+        2768
+      ],
+      "webhookId": "REGENERATE_ON_IMPORT"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('UI - Construir respuesta contextual').first().json.chat_id }}",
+        "text": "={{ $('UI - Construir respuesta contextual').first().json.message }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "💼 Sueldo",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "🏪 Cositas de Casa",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "🏛️ Subsidios",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "➕ Otros ingresos",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "❌ Cancelar",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true,
+          "one_time_keyboard": true
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "253a7372-384c-43a6-8e74-7d60b53f5fed",
+      "name": "UI - Menú tipo ingreso",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        8112,
+        2864
+      ],
+      "webhookId": "REGENERATE_ON_IMPORT"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('UI - Construir respuesta contextual').first().json.chat_id }}",
+        "text": "={{ $('UI - Construir respuesta contextual').first().json.message }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "❌ Cancelar",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true,
+          "one_time_keyboard": false
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "c865cd32-6120-4504-9eda-95de7eaee879",
+      "name": "UI - Pedir importe ingreso",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        8336,
+        3152
+      ],
+      "webhookId": "REGENERATE_ON_IMPORT"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('UI - Construir respuesta contextual').first().json.chat_id }}",
+        "text": "={{ $('UI - Construir respuesta contextual').first().json.message }}",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "✅ Confirmar",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "❌ Cancelar",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true,
+          "one_time_keyboard": true
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "c40a6463-22f6-4f9b-ab5a-b36397d7d01f",
+      "name": "UI - Confirmar ingreso guiado",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        8560,
+        2864
+      ],
+      "webhookId": "REGENERATE_ON_IMPORT"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "edae4dfe-752b-4773-8ad0-5ad280b1e620",
+              "leftValue": "={{ $json.screen }}",
+              "rightValue": "expense_category",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5c820fee-8e21-46fb-9fcc-5fabb6f98a92",
+      "name": "¿Pantalla gasto categoría?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        7216,
+        2672
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ac30e5e7-7f73-4749-98da-5150538cb62d",
+              "leftValue": "={{ $json.screen }}",
+              "rightValue": "expense_amount",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ca3e0384-fdba-48c7-af15-d6e46ec6a0be",
+      "name": "¿Pantalla gasto importe?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        7440,
+        2768
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0ad5af8f-b60f-4d3f-b345-7e26fc31b3ca",
+              "leftValue": "={{ $json.screen }}",
+              "rightValue": "expense_confirm",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "2f8e9687-cc51-4a20-a3c3-b62f6fa32be5",
+      "name": "¿Pantalla gasto confirmar?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        7664,
+        2864
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "70dcaba1-dc80-4eaa-b614-6fdc485682ae",
+              "leftValue": "={{ $json.screen }}",
+              "rightValue": "income_category",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6aef7262-0730-42f0-ba4d-0721c8d6cda9",
+      "name": "¿Pantalla ingreso categoría?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        7888,
+        2960
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "2e548d9e-9c1c-44aa-832d-5000aa0c401c",
+              "leftValue": "={{ $json.screen }}",
+              "rightValue": "income_amount",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "9ea56cc9-ac89-4fb9-ba54-5c269f2fab3c",
+      "name": "¿Pantalla ingreso importe?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        8112,
+        3056
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e4fa45a1-f6df-40bf-9f83-f52d36d8ae8d",
+              "leftValue": "={{ $json.screen }}",
+              "rightValue": "income_confirm",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "9c923d56-c761-4e0b-b5e9-7bee108c074e",
+      "name": "¿Pantalla ingreso confirmar?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        8336,
+        2960
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "95d03acf-6c4c-46ca-9224-406d3fe2810d",
+              "leftValue": "={{ $json.forward_after_persist }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "33636a30-a2d6-43a5-92df-0335f1d16c66",
+      "name": "¿Reenviar al Router después de persistir?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2960,
+        512
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const x=$json; return [{json:x.router_payload||x}];"
+      },
+      "id": "35255650-abb4-4b7d-8df4-caaeaad28869",
+      "name": "UI - Preparar payload guiado para Router",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3184,
+        464
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "06cc2560-9e4f-4620-aeb2-a91410e89345",
+              "leftValue": "={{ $('UI - Detectar menú / flujo').first().json.ui_restore_main === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "8fafc378-863e-4bd1-8afe-e21e0a9175dc",
+      "name": "¿Restaurar menú tras Router?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3632,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Telegram Trigger').first().json.message.chat.id }}",
+        "text": "🏠 Menú principal",
+        "replyMarkup": "replyKeyboard",
+        "replyKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "💸 Registrar gasto",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "💰 Registrar ingreso",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "📊 Consultas",
+                    "additionalFields": {}
+                  },
+                  {
+                    "text": "✏️ Corregir movimiento",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "📅 Cierre mensual",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            },
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "⚙️ Más",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "replyKeyboardOptions": {
+          "resize_keyboard": true,
+          "one_time_keyboard": false
+        },
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "19e34cff-73c0-4b90-9ed9-f0e818cb2fca",
+      "name": "UI - Restaurar menú post acción",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3856,
+        384
+      ],
+      "webhookId": "REGENERATE_ON_IMPORT"
+    },
+    {
+      "parameters": {
+        "content": "### v34 — Router v39\nConserva la interfaz guiada multimoneda de v33 y relinka la entrada principal al 02 v39, que a su vez usa 04 v31 para correcciones con botones. No cambia la lógica de gasto/ingreso/consulta del 01.",
+        "height": 220,
+        "width": 620
+      },
+      "id": "551a74d7-6d2e-4f3d-b541-7ec0020224c6",
+      "name": "NOTA - v34 router v39",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### v35 — Router v40\nConserva la interfaz guiada multimoneda de v34 y relinka la entrada principal al 02 v40, que usa 03 v94 para PDFs/importaciones y 04 v31 para correcciones con botones. No cambia la lógica de gasto, ingreso ni consultas del 01.",
+        "height": 240,
+        "width": 680
+      },
+      "id": "68fe1734-128f-4fe4-a849-14d6b8c40c57",
+      "name": "NOTA - v35 router v40",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3600,
+        0
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "UI - Leer estado guiado persistente",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "UI - Detectar menú / flujo": {
+      "main": [
+        [
+          {
+            "node": "¿Pasa al Router 02?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pasa al Router 02?": {
+      "main": [
+        [
+          {
+            "node": "Llamar 02 - Router",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "UI - Leer Pendientes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "UI - Leer Pendientes": {
+      "main": [
+        [
+          {
+            "node": "UI - Leer Cierre_Checklist",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "UI - Leer Cierre_Checklist": {
+      "main": [
+        [
+          {
+            "node": "UI - Construir respuesta contextual",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "UI - Construir respuesta contextual": {
+      "main": [
+        [
+          {
+            "node": "¿Persistir estado guiado?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pantalla main?": {
+      "main": [
+        [
+          {
+            "node": "UI - Enviar menú principal",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Pantalla cierre idle?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pantalla cierre idle?": {
+      "main": [
+        [
+          {
+            "node": "UI - Menú cierre sin cierre activo",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Pantalla cierre activa?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pantalla cierre activa?": {
+      "main": [
+        [
+          {
+            "node": "UI - Menú cierre activo",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Pantalla movimientos?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pantalla movimientos?": {
+      "main": [
+        [
+          {
+            "node": "UI - Menú movimientos",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Pantalla corregir con pendientes?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pantalla corregir con pendientes?": {
+      "main": [
+        [
+          {
+            "node": "UI - Menú corregir con pendientes",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Pantalla corregir limpio?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pantalla corregir limpio?": {
+      "main": [
+        [
+          {
+            "node": "UI - Menú corregir limpio",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Pantalla más?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pantalla más?": {
+      "main": [
+        [
+          {
+            "node": "UI - Menú más",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Pantalla gasto categoría?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pantalla concepto?": {
+      "main": [
+        [],
+        [
+          {
+            "node": "¿Pantalla fecha?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pantalla fecha?": {
+      "main": [
+        [],
+        [
+          {
+            "node": "¿Pantalla importe?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pantalla importe?": {
+      "main": [
+        [],
+        [
+          {
+            "node": "¿Pantalla gasto categoría?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "UI - Recuperar respuesta después de persistir": {
+      "main": [
+        [
+          {
+            "node": "¿Reenviar al Router después de persistir?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Llamar 02 - Router": {
+      "main": [
+        [
+          {
+            "node": "¿Restaurar menú tras Router?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Restaurar menú tras Router?": {
+      "main": [
+        [
+          {
+            "node": "UI - Restaurar menú post acción",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Reenviar al Router después de persistir?": {
+      "main": [
+        [
+          {
+            "node": "UI - Preparar payload guiado para Router",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Pantalla main?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "UI - Preparar payload guiado para Router": {
+      "main": [
+        [
+          {
+            "node": "Llamar 02 - Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pantalla gasto categoría?": {
+      "main": [
+        [
+          {
+            "node": "UI - Menú categorías gasto",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Pantalla gasto importe?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pantalla gasto importe?": {
+      "main": [
+        [
+          {
+            "node": "UI - Pedir importe gasto",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Pantalla gasto confirmar?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pantalla gasto confirmar?": {
+      "main": [
+        [
+          {
+            "node": "UI - Confirmar gasto guiado",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Pantalla ingreso categoría?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pantalla ingreso categoría?": {
+      "main": [
+        [
+          {
+            "node": "UI - Menú tipo ingreso",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Pantalla ingreso importe?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pantalla ingreso importe?": {
+      "main": [
+        [
+          {
+            "node": "UI - Pedir importe ingreso",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Pantalla ingreso confirmar?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pantalla ingreso confirmar?": {
+      "main": [
+        [
+          {
+            "node": "UI - Confirmar ingreso guiado",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "UI - Respuesta contextual",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "UI - Leer estado guiado persistente": {
+      "main": [
+        [
+          {
+            "node": "UI - Detectar menú / flujo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Persistir estado guiado?": {
+      "main": [
+        [
+          {
+            "node": "UI - Preparar estado guiado",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Pantalla main?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "UI - Preparar estado guiado": {
+      "main": [
+        [
+          {
+            "node": "UI - Guardar estado guiado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "UI - Guardar estado guiado": {
+      "main": [
+        [
+          {
+            "node": "UI - Recuperar respuesta después de persistir",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": true
+  },
+  "versionId": "e47805bf-3ab0-40ba-8068-eff128ec67a2",
+  "nodeGroups": [],
+  "tags": []
+}
